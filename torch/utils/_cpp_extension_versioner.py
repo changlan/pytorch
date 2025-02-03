@@ -1,3 +1,4 @@
+# mypy: allow-untyped-defs
 import collections
 
 
@@ -12,7 +13,7 @@ def update_hash(seed, value):
 
 def hash_source_files(hash_value, source_files):
     for filename in source_files:
-        with open(filename) as file:
+        with open(filename, 'rb') as file:
             hash_value = update_hash(hash_value, file.read())
     return hash_value
 
@@ -25,7 +26,7 @@ def hash_build_arguments(hash_value, build_arguments):
     return hash_value
 
 
-class ExtensionVersioner(object):
+class ExtensionVersioner:
     def __init__(self):
         self.entries = {}
 

@@ -6,6 +6,7 @@
 #include <torch/csrc/distributed/rpc/python_functions.h>
 #include <torch/csrc/distributed/rpc/python_rpc_handler.h>
 #include <torch/csrc/distributed/rpc/request_callback_impl.h>
+#include <torch/csrc/distributed/rpc/rpc.h>
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 #include <torch/csrc/distributed/rpc/rref_context.h>
 #include <torch/csrc/distributed/rpc/tensorpipe_agent.h>
@@ -19,9 +20,7 @@
 #include <pybind11/chrono.h>
 #include <pybind11/operators.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 namespace {
 
@@ -110,11 +109,26 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
           // c10::hash, so  we need to use the qualified name
           // py::detail::hash, which unfortunately is in a detail namespace.
           .def(py::detail::hash(py::self)) // NOLINT
-          .def("__repr__", [](const WorkerInfo& workerInfo) {
-            std::ostringstream os;
-            os << workerInfo;
-            return os.str();
-          });
+          .def(
+              "__repr__",
+              [](const WorkerInfo& workerInfo) {
+                std::ostringstream os;
+                os << workerInfo;
+                return os.str();
+              })
+          .def(py::pickle(
+              /* __getstate__ */
+              [](const WorkerInfo& workerInfo) {
+                return py::make_tuple(workerInfo.name_, workerInfo.id_);
+              },
+              /* __setstate__ */
+              [](const py::tuple& t) {
+                TORCH_CHECK(t.size() == 2, "Invalid WorkerInfo state.");
+
+                WorkerInfo info(
+                    t[0].cast<std::string>(), t[1].cast<worker_id_t>());
+                return info;
+              }));
 
   auto rpcAgent =
       shared_ptr_class_<RpcAgent>(module, "RpcAgent")
@@ -122,7 +136,8 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
               "join",
               &RpcAgent::join,
               py::call_guard<py::gil_scoped_release>(),
-              py::arg("shutdown") = false)
+              py::arg("shutdown") = false,
+              py::arg("timeout") = 0)
           .def(
               "sync", &RpcAgent::sync, py::call_guard<py::gil_scoped_release>())
           .def(
@@ -521,15 +536,15 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
       .def(
           py::init<
               int,
-              optional<std::vector<std::string>>,
-              optional<std::vector<std::string>>,
+              std::optional<std::vector<std::string>>,
+              std::optional<std::vector<std::string>>,
               float,
               std::string,
               std::unordered_map<std::string, DeviceMap>,
               std::vector<c10::Device>>(),
           py::arg("num_worker_threads") = kDefaultNumWorkerThreads,
-          py::arg("_transports") = optional<std::vector<std::string>>(),
-          py::arg("_channels") = optional<std::vector<std::string>>(),
+          py::arg("_transports") = std::optional<std::vector<std::string>>(),
+          py::arg("_channels") = std::optional<std::vector<std::string>>(),
           py::arg("rpc_timeout") = kDefaultRpcTimeoutSeconds,
           py::arg("init_method") = kDefaultInitMethod,
           py::arg("device_maps") = std::unordered_map<std::string, DeviceMap>(),
@@ -561,7 +576,7 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
               [](const c10::intrusive_ptr<::c10d::Store>& store,
                  std::string selfName,
                  worker_id_t selfId,
-                 int worldSize,
+                 std::optional<int> worldSize,
                  TensorPipeRpcBackendOptions opts,
                  std::unordered_map<std::string, DeviceMap> reverseDeviceMaps,
                  std::vector<c10::Device> devices) {
@@ -588,7 +603,8 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
           "join",
           &TensorPipeAgent::join,
           py::call_guard<py::gil_scoped_release>(),
-          py::arg("shutdown") = false)
+          py::arg("shutdown") = false,
+          py::arg("timeout") = 0)
       .def(
           "shutdown",
           &TensorPipeAgent::shutdown,
@@ -617,7 +633,17 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
           "_get_device_map",
           (DeviceMap(TensorPipeAgent::*)(const WorkerInfo& dst) const) &
               TensorPipeAgent::getDeviceMap,
-          py::call_guard<py::gil_scoped_release>());
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "_get_backend_options",
+          &TensorPipeAgent::getBackendOptions,
+          py::call_guard<py::gil_scoped_release>())
+      .def(
+          "_update_group_membership",
+          &TensorPipeAgent::updateGroupMembership,
+          py::call_guard<py::gil_scoped_release>())
+      .def_readonly("is_static_group", &TensorPipeAgent::isStaticGroup_)
+      .def_property_readonly("store", &TensorPipeAgent::getStore);
 
 #endif // USE_TENSORPIPE
 
@@ -739,7 +765,8 @@ PyObject* rpc_init(PyObject* _unused, PyObject* noargs) {
   module.def(
       "get_rpc_timeout",
       []() {
-        return RpcAgent::getCurrentRpcAgent()->getRpcTimeout().count() /
+        return static_cast<float>(
+                   RpcAgent::getCurrentRpcAgent()->getRpcTimeout().count()) /
             kSecToMsConversion;
       },
       R"(
@@ -830,6 +857,4 @@ PyMethodDef* python_functions() {
   return methods;
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

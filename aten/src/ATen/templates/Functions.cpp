@@ -2,6 +2,7 @@
 
 #include <ATen/Functions.h>
 #include <ATen/Utils.h>
+#include <c10/core/Allocator.h>
 
 namespace at {
 
@@ -15,7 +16,7 @@ Tensor TensorMaker::make_tensor() {
        !deleter_ || !ctx_,
        "The deleter and context arguments are mutually exclusive.");
 
-   if (device_ == nullopt) {
+   if (device_ == std::nullopt) {
      device_ = globalContext().getDeviceFromPtr(data_, opts_.device().type());
    }
 
@@ -36,23 +37,21 @@ Tensor TensorMaker::make_tensor() {
      data_ptr = makeDataPtrFromContext();
    }
 
-   Storage storage{Storage::use_byte_size_t{}, size_bytes, std::move(data_ptr)};
+   TORCH_CHECK(!resizeable_ || allocator_ != nullptr, "Must specify an allocator with allocator() if you want to use resizeable_storage()");
+   Storage storage{Storage::use_byte_size_t{}, size_bytes, std::move(data_ptr), /*allocator=*/allocator_, /*resizable=*/resizeable_};
 
    Tensor tensor = detail::make_tensor<TensorImpl>(
        std::move(storage), opts_.computeDispatchKey(), opts_.dtype());
 
-   if (sizes_.size() != 1 || sizes_[0] != 0) {
-     TensorImpl* tensor_impl = tensor.unsafeGetTensorImpl();
-
-     if (strides_) {
-       tensor_impl->set_sizes_and_strides(sizes_, *strides_);
-     } else {
-       tensor_impl->set_sizes_contiguous(sizes_);
-     }
-     if (storage_offset_) {
-       tensor_impl->set_storage_offset(*storage_offset_);
-     }
-   }
+  TensorImpl* tensor_impl = tensor.unsafeGetTensorImpl();
+  if (strides_) {
+    tensor_impl->set_sizes_and_strides(sizes_, *strides_);
+  } else {
+    tensor_impl->set_sizes_contiguous(sizes_);
+  }
+  if (storage_offset_) {
+    tensor_impl->set_storage_offset(*storage_offset_);
+  }
 
    return tensor;
  }
@@ -79,8 +78,8 @@ Tensor TensorMaker::make_tensor() {
    return storage_size;
  }
 
- inline DataPtr TensorMaker::makeDataPtrFromDeleter() const {
-   return InefficientStdFunctionContext::makeDataPtr(data_, deleter_, *device_);
+ inline DataPtr TensorMaker::makeDataPtrFromDeleter() noexcept {
+   return InefficientStdFunctionContext::makeDataPtr(data_, std::move(deleter_), *device_);
  }
 
  inline DataPtr TensorMaker::makeDataPtrFromContext() noexcept {

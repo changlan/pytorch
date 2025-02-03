@@ -1,17 +1,18 @@
+# mypy: ignore-errors
+
 r"""Importing this file includes common utility methods for checking quantized
 tensors and modules.
 """
 import numpy as np
 import torch
 from contextlib import contextmanager
-from torch.testing._internal.common_utils import TEST_WITH_ASAN, TEST_WITH_TSAN, TEST_WITH_UBSAN, IS_PPC, IS_MACOS, IS_WINDOWS
+from torch.testing._internal.common_utils import TEST_WITH_TSAN, IS_PPC, IS_MACOS, IS_WINDOWS
 
 supported_qengines = torch.backends.quantized.supported_engines
 supported_qengines.remove('none')
 # Note: We currently do not run QNNPACK tests on WINDOWS and MACOS as it is flaky. Issue #29326
 # QNNPACK is not supported on PPC
-# QNNPACK throws ASAN heap-buffer-overflow error.
-if 'qnnpack' in supported_qengines and any([IS_PPC, TEST_WITH_ASAN, TEST_WITH_TSAN, TEST_WITH_UBSAN, IS_MACOS, IS_WINDOWS]):
+if 'qnnpack' in supported_qengines and any([IS_PPC, TEST_WITH_TSAN, IS_MACOS, IS_WINDOWS]):
     supported_qengines.remove('qnnpack')
 
 def _conv_output_shape(input_size, kernel_size, padding, stride, dilation,
@@ -46,9 +47,12 @@ def _requantize(x, multiplier, zero_point, qmin=0, qmax=255, qtype=np.uint8):
     qx = np.clip(qx, qmin, qmax).astype(qtype)
     return qx
 
-def _calculate_dynamic_qparams(X, dtype, reduce_range=False):
+def _calculate_dynamic_qparams(X, dtype, reduce_range=False, qscheme=torch.per_tensor_affine):
     """Calculate the dynamic quantization parameters (scale, zero_point)
     according to the min and max element of the tensor"""
+    assert qscheme in (torch.per_tensor_affine, torch.per_tensor_symmetric)
+    if qscheme == torch.per_tensor_symmetric:
+        assert dtype == torch.qint8
     if isinstance(X, torch.Tensor):
         X = X.numpy()
     if dtype == torch.qint8:
@@ -63,17 +67,25 @@ def _calculate_dynamic_qparams(X, dtype, reduce_range=False):
             qmin, qmax = 0, 255
     min_val = X.min()
     max_val = X.max()
+    is_symmetric = (qscheme == torch.per_tensor_symmetric)
     if min_val == max_val:
         scale = 1.0
         zero_point = 0
     else:
-        max_val = max(max_val, 0.0)
-        min_val = min(min_val, 0.0)
-        scale = (max_val - min_val) / (qmax - qmin)
-        scale = max(scale, np.finfo(np.float32).eps)
-        zero_point = qmin - round(min_val / scale)
-        zero_point = max(qmin, zero_point)
-        zero_point = min(qmax, zero_point)
+        if is_symmetric:
+            max_val = max(max_val, -min_val)
+            min_val = -max_val
+            scale = (max_val - min_val) / (qmax - qmin)
+            scale = max(scale, np.finfo(np.float32).eps)
+            zero_point = 0
+        else:
+            max_val = max(max_val, 0.0)
+            min_val = min(min_val, 0.0)
+            scale = (max_val - min_val) / (qmax - qmin)
+            scale = max(scale, np.finfo(np.float32).eps)
+            zero_point = qmin - round(min_val / scale)
+            zero_point = max(qmin, zero_point)
+            zero_point = min(qmax, zero_point)
     return [float(scale), int(zero_point)]
 
 def _calculate_dynamic_per_channel_qparams(X, dtype):
@@ -114,10 +126,8 @@ def _snr(x, x_hat):
         signal, noise, SNR(in dB): Either floats or a nested list of floats
     """
     if isinstance(x, (list, tuple)):
-        assert(len(x) == len(x_hat))
-        res = []
-        for idx in range(len(x)):
-            res.append(_snr(x[idx], x_hat[idx]))
+        assert len(x) == len(x_hat)
+        res = [_snr(x[idx], x_hat[idx]) for idx in range(len(x))]
         return res
     if x_hat.is_quantized:
         x_hat = x_hat.dequantize()
@@ -165,6 +175,10 @@ def qengine_is_fbgemm():
     return torch.backends.quantized.engine == 'fbgemm'
 def qengine_is_qnnpack():
     return torch.backends.quantized.engine == 'qnnpack'
+def qengine_is_onednn():
+    return torch.backends.quantized.engine == 'onednn'
+def qengine_is_x86():
+    return torch.backends.quantized.engine == 'x86'
 
 # Helper function used to simulate per-channel fake-quant against any axis
 def _permute_to_axis_zero(X, axis):
@@ -206,5 +220,5 @@ def to_tensor(X, device):
     if not isinstance(X, torch.Tensor):
         X = torch.tensor(X)
     else:
-        X = X.clone().detach()
+        X = X.detach().clone()
     return X.to(device=torch.device(device), dtype=torch.float32)

@@ -5,7 +5,8 @@ set -ex
 UNKNOWN=()
 
 # defaults
-PARALLEL=0
+PARALLEL=1
+export TORCH_ONNX_EXPERIMENTAL_RUNTIME_TYPE_CHECK=ERRORS
 
 while [[ $# -gt 0 ]]
 do
@@ -23,13 +24,8 @@ do
 done
 set -- "${UNKNOWN[@]}" # leave UNKNOWN
 
-if [[ $PARALLEL == 1 ]]; then
-    pip install pytest-xdist
-fi
-
-pip install pytest scipy hypothesis # these may not be necessary
-pip install pytest-cov # installing since `coverage run -m pytest ..` doesn't work
-pip install -e tools/coverage_plugins_package # allows coverage to run w/o failing due to a missing plug-in
+# allows coverage to run w/o failing due to a missing plug-in
+pip install -e tools/coverage_plugins_package
 
 # realpath might not be available on MacOS
 script_path=$(python -c "import os; import sys; print(os.path.realpath(sys.argv[1]))" "${BASH_SOURCE[0]}")
@@ -44,45 +40,49 @@ args+=("--cov")
 args+=("--cov-report")
 args+=("xml:test/coverage.xml")
 args+=("--cov-append")
-if [[ $PARALLEL == 1 ]]; then
-  args+=("-n")
-  args+=("3")
+
+time python "${top_dir}/test/run_test.py" --onnx --shard "$SHARD_NUMBER" 2 --verbose
+
+if [[ "$SHARD_NUMBER" == "2" ]]; then
+  # xdoctests on onnx
+  xdoctest torch.onnx --style=google --options="+IGNORE_WHITESPACE"
 fi
 
-# onnxruntime only support py3
-# "Python.h" not found in py2, needed by TorchScript custom op compilation.
-if [[ "$BUILD_ENVIRONMENT" == *ort_test1* ||  "${SHARD_NUMBER}" == "1" ]]; then
-  # These exclusions are for tests that take a long time / a lot of GPU
-  # memory to run; they should be passing (and you will test them if you
-  # run them locally
-  pytest "${args[@]}" \
-    --ignore "$top_dir/test/onnx/test_pytorch_onnx_onnxruntime.py" \
-    --ignore "$top_dir/test/onnx/test_custom_ops.py" \
-    --ignore "$top_dir/test/onnx/test_models_onnxruntime.py" \
-    --ignore "$top_dir/test/onnx/test_utility_funs.py" \
-    --ignore "$top_dir/test/onnx/test_pytorch_onnx_caffe2.py" \
-    --ignore "$top_dir/test/onnx/test_pytorch_onnx_shape_inference.py" \
-    --ignore "$top_dir/test/onnx/test_pytorch_onnx_onnxruntime_cuda.py" \
-    --ignore "$top_dir/test/onnx/test_pytorch_onnx_caffe2_quantized.py" \
-    "${test_paths[@]}"
+if [[ "$SHARD_NUMBER" == "2" ]]; then
+  # Sanity check on torchbench w/ onnx
+  pip install pandas
+  log_folder="test/.torchbench_logs"
+  device="cpu"
+  modes=("accuracy" "performance")
+  compilers=("dynamo-onnx" "torchscript-onnx")
+  suites=("huggingface" "timm_models")
 
-  pytest "${args[@]}" \
-    "$top_dir/test/onnx/test_pytorch_onnx_onnxruntime.py::TestONNXRuntime_opset7" \
-    "$top_dir/test/onnx/test_pytorch_onnx_onnxruntime.py::TestONNXRuntime_opset8" \
-    "$top_dir/test/onnx/test_pytorch_onnx_onnxruntime.py::TestONNXRuntime" \
-    "$top_dir/test/onnx/test_custom_ops.py" \
-    "$top_dir/test/onnx/test_models_onnxruntime.py" \
-    "$top_dir/test/onnx/test_utility_funs.py" \
-    "$top_dir/test/onnx/test_pytorch_onnx_caffe2.py" \
-    "$top_dir/test/onnx/test_pytorch_onnx_caffe2_quantized.py" \
-    "$top_dir/test/onnx/test_pytorch_onnx_shape_inference.py"
-fi
-
-if [[ "$BUILD_ENVIRONMENT" == *ort_test2* || "${SHARD_NUMBER}" == "2" ]]; then
-  # Update the loop for new opsets
-  for i in $(seq 10 15); do
-    pytest "${args[@]}" \
-      "$top_dir/test/onnx/test_pytorch_onnx_onnxruntime.py::TestONNXRuntime_opset$i"
+  mkdir -p "${log_folder}"
+  for mode in "${modes[@]}"; do
+    for compiler in "${compilers[@]}"; do
+      for suite in "${suites[@]}"; do
+        output_file="${log_folder}/${compiler}_${suite}_float32_inference_${device}_${mode}.csv"
+        bench_file="benchmarks/dynamo/${suite}.py"
+        bench_args=("--${mode}" --float32 "-d${device}" "--output=${output_file}" "--output-directory=${top_dir}" --inference -n5 "--${compiler}" --no-skip --dashboard --batch-size 1)
+        # Run only selected model for each suite to quickly validate the benchmark suite works as expected.
+        case "$suite" in
+            "torchbench")
+                bench_args+=(-k resnet18)
+                ;;
+            "huggingface")
+                bench_args+=(-k ElectraForQuestionAnswering)
+                ;;
+            "timm_models")
+                bench_args+=(-k lcnet_050)
+                ;;
+            *)
+                echo "Unknown suite: ${suite}"
+                exit 1
+                ;;
+        esac
+        python "${top_dir}/${bench_file}" "${bench_args[@]}"
+      done
+    done
   done
 fi
 

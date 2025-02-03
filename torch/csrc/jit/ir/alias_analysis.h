@@ -7,8 +7,7 @@
 #include <torch/csrc/jit/passes/create_functional_graphs.h>
 #include <torch/csrc/jit/passes/utils/memory_dag.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 /**
  * Alias analysis pass.
@@ -25,11 +24,11 @@ namespace jit {
  * is considered safe.
  *
  * There is a special alias set called the "wildcard set", which indicates that
- * we're not sure what this value may alias. To be conservative, we consider
- * the wildcard alias set as potentially aliasing any value within the same
- * type class. Whenever a value becomes contained by another value, such as
- * when a Tensor is appended to a List[Tensor], the contained element becomes
- * part of the wildcard set.
+ * we're not sure what this value may alias. To be conservative, we consider the
+ * wildcard alias set as potentially aliasing any other wildcard value within
+ * the same type class. Whenever a value becomes contained by another value,
+ * such as when a Tensor is appended to a List[Tensor], the contained element
+ * becomes part of the wildcard set.
  *
  * Values that contain other mutable types, such as List[Tensor], are
  * initialized as containing the Wildcard set for all contained mutable types.
@@ -40,12 +39,21 @@ namespace jit {
  * mutable, so you can add and delete elements from it. On the other
  * hand, you can't modify a Tuple once you create it, making `Tuple` an
  * immutable container.)
+ *
+ * `isFrozen` - if the Module is frozen then consider attributes as freshly
+ * created objects. Freezing API invokes alias analysis to check if they are
+ * mutated internally.
+ *
+ * `descendFunctionCalls` - recursively analyze function and method calls
+ * instead of conservative analysis. Generally analysis should be done after
+ * inlining so the implmentation for recursive analysis is unoptimized.
  */
 class AliasDb {
  public:
   TORCH_API explicit AliasDb(
       std::shared_ptr<Graph> graphi,
-      bool isFrozen = false);
+      bool isFrozen = false,
+      bool descendFunctionCalls = false);
   TORCH_API ~AliasDb();
 
   // There are limitations to what effects the alias analysis can track. Two
@@ -194,7 +202,7 @@ class AliasDb {
    * Wildcard methods
    */
   // Register `v` as a wildcard value.
-  c10::optional<Element*> setWildcard(const Value* v);
+  std::optional<Element*> setWildcard(const Value* v);
 
   // Is this a value which will not alias?
   bool nonAliasingValue(const Value* elem) const;
@@ -208,6 +216,7 @@ class AliasDb {
   void analyzeImpl(Node* node);
   void analyzeIf(Node* node);
   void analyzeLoop(Node* node);
+  void analyzeSubgraph(Node* node, const std::shared_ptr<Graph>& subgraph);
   void analyzeSubgraph(Node* node);
   void analyzeCreator(Node* node);
   void analyzeExtractor(Node* node);
@@ -215,6 +224,8 @@ class AliasDb {
   void analyzeBroadcastingChunk(Node* node);
   void analyzeFork(Node* node);
   void analyzeWait(Node* node);
+  void analyzeAwaitable(Node* node);
+  void analyzeAwaitableWait(Node* node);
   void analyzeRpcAsync(Node* node);
   void analyzeBatchNorm(Node* node);
   void analyzeInstanceNorm(Node* node);
@@ -249,6 +260,10 @@ class AliasDb {
   // internally.
   bool isFrozen_;
 
+  bool descend_function_calls_;
+  std::unordered_map<Graph*, std::vector<std::shared_ptr<Graph>>>
+      function_call_copies_;
+
   // The points-to graph that stores aliasing relationships
   std::unique_ptr<MemoryDAGBuilder> memoryDAGBuilder_;
   std::unique_ptr<MemoryDAG> memoryDAG_;
@@ -258,7 +273,7 @@ class AliasDb {
   // All wildcard Elements (one for each unique mutable type)
   ska::flat_hash_map<TypePtr, Element*, HashType, EqualType> wildcardIndex_;
   Element* getWildcard(const TypePtr& type) const;
-  c10::optional<Element*> tryGetOrCreateWildcard(const TypePtr& type);
+  std::optional<Element*> tryGetOrCreateWildcard(const TypePtr& type);
   void addContainedTypesToFreshElement(
       Element* container_elem,
       const AliasTypeSet& mut_types);
@@ -285,9 +300,9 @@ class AliasDb {
 
   // Map of nodes to the memory locations that they write to
   using TWriteIndex = ska::flat_hash_map<Node*, MemoryLocations>;
-  c10::optional<TWriteIndex> writeIndex_;
+  std::optional<TWriteIndex> writeIndex_;
   // Collection of all memory locations that are written to.
-  c10::optional<MemoryLocations> writtenToLocationsIndex_;
+  std::optional<MemoryLocations> writtenToLocationsIndex_;
   void buildWrittenToLocationsIndex();
 
   std::unordered_set<const Value*> wildcards_;
@@ -300,7 +315,6 @@ class AliasDb {
 // Helper check that invariants over AliasDb are maintained.
 // Useful if you are using the AliasDb mutation API and want to check you did
 // the right thing.
-void Lint(const AliasDb* db);
+TORCH_API void Lint(const AliasDb* db);
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit
